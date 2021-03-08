@@ -1,133 +1,198 @@
-// Copyright 2015 The Gorilla WebSocket Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
-// +build ignore
-
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
-	"html/template"
 	"log"
 	"net/http"
+	"sync"
 
+	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	"github.com/kjk/betterguid"
+	"github.com/pbivrell/office/util"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
-
-var addr = flag.String("addr", "localhost:8080", "http service address")
 
 var upgrader = websocket.Upgrader{} // use default options
 
-func echo(w http.ResponseWriter, r *http.Request) {
-	c, err := upgrader.Upgrade(w, r, nil)
+type dataPair struct {
+	message []byte
+	mt      int
+}
+
+func (c *coordinator) subscribe(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Print("upgrade:", err)
 		return
 	}
-	defer c.Close()
-	for {
-		mt, message, err := c.ReadMessage()
-		if err != nil {
-			log.Println("read:", err)
-			break
+	defer conn.Close()
+
+}
+
+type subscriber struct {
+	chans map[string]chan dataPair
+	*sync.Mutex
+}
+
+const (
+	BufferSize = 100
+)
+
+func (s *subscriber) subscribe() (chan dataPair, func()) {
+	s.Lock()
+	defer s.Unlock()
+
+	index := betterguid.New()
+
+	c := make(chan dataPair, BufferSize)
+
+	s.chans[index] = c
+
+	for _, neighbor := range s.chans {
+		data, _ := json.Marshal(struct {
+			Message string `json:"message"`
+		}{
+			Message: "solicit",
+		})
+		neighbor <- dataPair{
+			message: data,
+			mt:      websocket.TextMessage,
 		}
-		log.Printf("recv: %s", message)
-		err = c.WriteMessage(mt, message)
-		if err != nil {
-			log.Println("write:", err)
-			break
-		}
+		break
+	}
+
+	return c, func() {
+		s.Lock()
+		defer s.Unlock()
+
+		delete(s.chans, index)
 	}
 }
 
-func home(w http.ResponseWriter, r *http.Request) {
-	homeTemplate.Execute(w, "ws://"+r.Host+"/echo")
+type coordinator struct {
+	b chan dataPair
+	s *subscriber
+}
+
+func (c *coordinator) process() {
+	for {
+		select {
+		case data := <-c.b:
+			c.s.Lock()
+			for _, dChan := range c.s.chans {
+				dChan <- data
+			}
+			c.s.Unlock()
+		}
+	}
+
+}
+
+func (c *coordinator) broadcast(w http.ResponseWriter, r *http.Request) {
+
+	logger := util.NewLogrusLogger()
+
+	fields := util.Fields{
+		"method": r.Method,
+		"url":    r.URL.String(),
+		"ua":     r.Header.Get("User-Agent"),
+	}
+
+	websocketStatus.WithLabelValues("open").Inc()
+	defer websocketStatus.WithLabelValues("close").Inc()
+
+	logger.WithFields(fields).Infof("web socket created")
+	defer logger.WithFields(fields).Infof("web socket closed")
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		websocketStatus.WithLabelValues("upgrade").Inc()
+		return
+	}
+
+	readClose := make(chan struct{}, 0)
+	defer conn.Close()
+	go func() {
+		for {
+			mt, message, err := conn.ReadMessage()
+			if err != nil {
+				websocketStatus.WithLabelValues("read").Inc()
+				break
+			}
+			c.b <- dataPair{
+				mt:      mt,
+				message: message,
+			}
+		}
+		readClose <- struct{}{}
+	}()
+	dChan, unsubscribe := c.s.subscribe()
+	defer unsubscribe()
+
+	for {
+		select {
+		case data := <-dChan:
+			err = conn.WriteMessage(data.mt, data.message)
+			if err != nil {
+				websocketStatus.WithLabelValues("write").Inc()
+				if errors.Is(err, websocket.ErrCloseSent) {
+					websocketStatus.WithLabelValues("write-close").Inc()
+					return
+				}
+			}
+		case <-readClose:
+			return
+
+		}
+	}
+
 }
 
 func main() {
+
+	bChan := make(chan dataPair, 2000)
+
+	coord := coordinator{
+		b: bChan,
+		s: &subscriber{
+			chans: make(map[string]chan dataPair),
+			Mutex: &sync.Mutex{},
+		},
+	}
+
+	go coord.process()
+
 	flag.Parse()
 	log.SetFlags(0)
-	http.HandleFunc("/echo", echo)
-	http.HandleFunc("/", home)
-	log.Fatal(http.ListenAndServe(*addr, nil))
+	r := mux.NewRouter()
+	r.HandleFunc("/echo", coord.broadcast)
+	r.Handle("/metrics", promhttp.Handler())
+	r.PathPrefix("/html/").Handler(http.StripPrefix("/html/", http.FileServer(http.Dir(htmlDir))))
+	log.Fatal(http.ListenAndServe(addr, r))
 }
 
-var homeTemplate = template.Must(template.New("").Parse(`
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<script>  
-window.addEventListener("load", function(evt) {
+var addr, htmlDir string
 
-    var output = document.getElementById("output");
-    var input = document.getElementById("input");
-    var ws;
+var websocketStatus *prometheus.CounterVec
 
-    var print = function(message) {
-        var d = document.createElement("div");
-        d.textContent = message;
-        output.appendChild(d);
-    };
+func init() {
 
-    document.getElementById("open").onclick = function(evt) {
-        if (ws) {
-            return false;
-        }
-        ws = new WebSocket("{{.}}");
-        ws.onopen = function(evt) {
-            print("OPEN");
-        }
-        ws.onclose = function(evt) {
-            print("CLOSE");
-            ws = null;
-        }
-        ws.onmessage = function(evt) {
-            print("RESPONSE: " + evt.data);
-        }
-        ws.onerror = function(evt) {
-            print("ERROR: " + evt.data);
-        }
-        return false;
-    };
+	flag.StringVar(&addr, "addr", "localhost:8080", "http service address")
+	flag.StringVar(&htmlDir, "html", "./html", "path to html dir")
+	flag.Parse()
 
-    document.getElementById("send").onclick = function(evt) {
-        if (!ws) {
-            return false;
-        }
-        print("SEND: " + input.value);
-        ws.send(input.value);
-        return false;
-    };
+	websocketStatus = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        "websocket_status",
+		Help:        "web socket status history",
+		ConstLabels: prometheus.Labels{"addr": addr},
+	}, []string{
+		"status",
+	})
 
-    document.getElementById("close").onclick = function(evt) {
-        if (!ws) {
-            return false;
-        }
-        ws.close();
-        return false;
-    };
+	prometheus.MustRegister(websocketStatus)
 
-});
-</script>
-</head>
-<body>
-<table>
-<tr><td valign="top" width="50%">
-<p>Click "Open" to create a connection to the server, 
-"Send" to send a message to the server and "Close" to close the connection. 
-You can change the message and send multiple times.
-<p>
-<form>
-<button id="open">Open</button>
-<button id="close">Close</button>
-<p><input id="input" type="text" value="Hello world!">
-<button id="send">Send</button>
-</form>
-</td><td valign="top" width="50%">
-<div id="output"></div>
-</td></tr></table>
-</body>
-</html>
-`))
+}
